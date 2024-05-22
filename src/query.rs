@@ -155,6 +155,7 @@ impl Query {
         default_format: Option<&str>,
     ) -> Result<Response> {
         let query = self.sql.finish()?;
+        log::debug!("executing query: {}", query);
 
         let mut url =
             Url::parse(&self.client.url).map_err(|err| Error::InvalidParams(Box::new(err)))?;
