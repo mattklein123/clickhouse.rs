@@ -3,6 +3,7 @@ use crate::error::Error::SequenceMustHaveLength;
 use crate::error::{Error, Result};
 use crate::row_metadata::RowMetadata;
 use crate::rowbinary::validation::{DataTypeValidator, SchemaValidator, SerdeType};
+use crate::serde::RAW_BINARY_NAME_TAG;
 use crate::types::int256;
 use bytes::BufMut;
 use clickhouse_types::put_leb128;
@@ -36,6 +37,187 @@ pub(crate) fn serialize_with_validation<B: BufMut, R: Row + Serialize>(
     let mut serializer = RowBinarySerializer::new(buffer, validator);
     value.serialize(&mut serializer)?;
     Ok(())
+}
+
+// Used for serializing raw bytes without length prefix. This is expected by
+// aggregation functions which parse the binary payload directly.
+struct RawBinarySerializer<'a, B> {
+    buffer: &'a mut B,
+}
+
+impl<'a, B: BufMut> Serializer for RawBinarySerializer<'a, B> {
+    type Error = Error;
+    type Ok = ();
+    type SerializeMap = Impossible<(), Error>;
+    type SerializeSeq = Impossible<(), Error>;
+    type SerializeStruct = Impossible<(), Error>;
+    type SerializeStructVariant = Impossible<(), Error>;
+    type SerializeTuple = Impossible<(), Error>;
+    type SerializeTupleStruct = Impossible<(), Error>;
+    type SerializeTupleVariant = Impossible<(), Error>;
+
+    fn serialize_bool(self, _v: bool) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_i8(self, _v: i8) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_i16(self, _v: i16) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_i32(self, _v: i32) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_i64(self, _v: i64) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_u8(self, _v: u8) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_u16(self, _v: u16) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_u32(self, _v: u32) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_u64(self, _v: u64) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_f32(self, _v: f32) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_f64(self, _v: f64) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_char(self, _v: char) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_str(self, _v: &str) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_bytes(self, v: &[u8]) -> std::result::Result<Self::Ok, Self::Error> {
+        self.buffer.put_slice(v);
+        Ok(())
+    }
+
+    fn serialize_none(self) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_some<T: Serialize + ?Sized>(
+        self,
+        _value: &T,
+    ) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_unit(self) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_unit_struct(
+        self,
+        _name: &'static str,
+    ) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+    ) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _value: &T,
+    ) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_newtype_variant<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _value: &T,
+    ) -> std::result::Result<Self::Ok, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_seq(
+        self,
+        _len: Option<usize>,
+    ) -> std::result::Result<Self::SerializeSeq, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_tuple(
+        self,
+        _len: usize,
+    ) -> std::result::Result<Self::SerializeTuple, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> std::result::Result<Self::SerializeTupleStruct, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> std::result::Result<Self::SerializeTupleVariant, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_map(
+        self,
+        _len: Option<usize>,
+    ) -> std::result::Result<Self::SerializeMap, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        _len: usize,
+    ) -> std::result::Result<Self::SerializeStruct, Self::Error> {
+        unreachable!()
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _variant_index: u32,
+        _variant: &'static str,
+        _len: usize,
+    ) -> std::result::Result<Self::SerializeStructVariant, Self::Error> {
+        unreachable!()
+    }
 }
 
 /// A serializer for the RowBinary format.
@@ -190,6 +372,13 @@ impl<'ser, B: BufMut, R: Row, V: SchemaValidator<R>> Serializer
             value.serialize(WithoutLenPrefix {
                 buffer: &mut self.buffer,
             })
+        } else
+        // This type is special cased to force raw byte serialization without length
+        // prefix. See RawBinary for more info.
+        if name == RAW_BINARY_NAME_TAG {
+            return value.serialize(RawBinarySerializer {
+                buffer: &mut self.buffer,
+            });
         } else {
             value.serialize(self)
         }

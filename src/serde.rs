@@ -43,6 +43,31 @@ macro_rules! option {
     };
 }
 
+/// This will send binary data to the database in raw form. It will not be
+/// length prefixed. This is required for sending binary data into
+/// AggregateFunction types for example.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RawBinary(pub Vec<u8>);
+
+pub(crate) const RAW_BINARY_NAME_TAG: &str = "__clickhouse::serde::RawBinary__";
+
+impl Serialize for RawBinary {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct InnerRawBinary<'a>(&'a [u8]);
+
+        impl Serialize for InnerRawBinary<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+
+        // This forces the type to go through the new type path with a specific tag.
+        // This will cause the serializer to switch to raw binary before
+        // serializing the bytes above.
+        serializer.serialize_newtype_struct(RAW_BINARY_NAME_TAG, &InnerRawBinary(&self.0))
+    }
+}
+
 /// Ser/de [`std::net::Ipv4Addr`] to/from `IPv4`.
 pub mod ipv4 {
     use std::net::Ipv4Addr;
