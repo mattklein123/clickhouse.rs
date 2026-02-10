@@ -1,3 +1,5 @@
+use crate::error::Result;
+use crate::row_metadata::RowMetadata;
 use crate::sql;
 use serde::{Deserialize, Serialize};
 
@@ -38,6 +40,17 @@ pub trait Row {
     const KIND: RowKind;
     #[doc(hidden)]
     type Value<'a>: Row;
+}
+
+/// Represents a row that can be decoded from RowBinary.
+///
+/// This trait is implemented automatically for all `Row + Deserialize` types.
+/// Rows that need custom raw-binary decoding can implement it manually.
+pub trait RowBinaryDecode: Row {
+    fn decode_rowbinary<'data>(
+        input: &mut &'data [u8],
+        metadata: Option<&RowMetadata>,
+    ) -> Result<Self::Value<'data>>;
 }
 
 /// Represents a row that can be read from the database.
@@ -112,8 +125,21 @@ pub trait Row {
 /// We use [`Row`] instead of [`RowOwned`] and `R::Value<'_>` instead of `R` here.
 /// The last one is actually the same `R` but with a changed lifetime restricted
 /// to the cursor.
-pub trait RowRead: for<'a> Row<Value<'a>: Deserialize<'a>> {}
-impl<R> RowRead for R where R: for<'a> Row<Value<'a>: Deserialize<'a>> {}
+pub trait RowRead: RowBinaryDecode {}
+impl<R> RowRead for R where R: RowBinaryDecode {}
+
+impl<T> RowBinaryDecode for T
+where
+    T: Row,
+    for<'a> T::Value<'a>: Deserialize<'a>,
+{
+    fn decode_rowbinary<'data>(
+        input: &mut &'data [u8],
+        metadata: Option<&RowMetadata>,
+    ) -> Result<Self::Value<'data>> {
+        crate::rowbinary::deserialize_row::<Self::Value<'data>>(input, metadata)
+    }
+}
 
 /// Represents a row that can be written into the database.
 ///

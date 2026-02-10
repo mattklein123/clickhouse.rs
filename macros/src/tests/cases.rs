@@ -131,3 +131,16 @@ fn crate_attribute() {
         }
     }
 }
+
+#[test]
+fn raw_binary_field() {
+    render! {
+        #[derive(Row)]
+        struct Sample {
+            a: u8,
+            #[clickhouse(raw_binary)]
+            raw: RawPayload,
+            b: u16,
+        }
+    }
+}

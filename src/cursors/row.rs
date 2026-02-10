@@ -8,7 +8,6 @@ use crate::{
     error::{Error, Result},
     query_summary::QuerySummary,
     response::Response,
-    rowbinary,
 };
 use clickhouse_types::error::TypesError;
 use clickhouse_types::parse_rbwnat_columns_header;
@@ -152,10 +151,7 @@ impl<T> RowCursor<T> {
                 // This can be deleted when Polonius lands in stable Rust.
                 let mut slice: &'a [u8] = unsafe { &*ptr::from_ref(bytes_ref.slice()) };
 
-                let result = rowbinary::deserialize_row::<T::Value<'a>>(
-                    &mut slice,
-                    self.row_metadata.as_ref(),
-                );
+                let result = T::decode_rowbinary(&mut slice, self.row_metadata.as_ref());
 
                 match result {
                     Ok(value) => {

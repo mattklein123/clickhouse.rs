@@ -1,5 +1,6 @@
 //! Contains ser/de modules for different external types.
 
+use crate::error::Error;
 use serde::{
     de::{Deserialize, Deserializer},
     ser::{Serialize, Serializer},
@@ -66,6 +67,15 @@ impl Serialize for RawBinary {
         // serializing the bytes above.
         serializer.serialize_newtype_struct(RAW_BINARY_NAME_TAG, &InnerRawBinary(&self.0))
     }
+}
+
+/// Decode a raw binary payload from a RowBinary field.
+pub trait RawBinaryDecode: Sized {
+    fn decode_raw(input: &mut &[u8]) -> Result<Self, Error>;
+}
+
+pub trait RawBinaryRead<'de> {
+    fn deserialize_raw_binary<T: RawBinaryDecode>(&mut self) -> Result<T, Error>;
 }
 
 /// Ser/de [`std::net::Ipv4Addr`] to/from `IPv4`.
