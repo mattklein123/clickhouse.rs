@@ -5,7 +5,6 @@ use crate::{
     cursors::RawCursor,
     error::{Error, Result},
     response::Response,
-    rowbinary,
 };
 use clickhouse_types::error::TypesError;
 use clickhouse_types::parse_rbwnat_columns_header;
@@ -96,10 +95,7 @@ impl<T> RowCursor<T> {
         loop {
             if self.bytes.remaining() > 0 {
                 let mut slice = self.bytes.slice();
-                let result = rowbinary::deserialize_row::<T::Value<'_>>(
-                    &mut slice,
-                    self.row_metadata.as_ref(),
-                );
+                let result = T::decode_rowbinary(&mut slice, self.row_metadata.as_ref());
 
                 match result {
                     Ok(value) => {

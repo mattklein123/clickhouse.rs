@@ -30,14 +30,15 @@ pub(crate) trait SchemaValidator<R: Row>: Sized {
     fn get_schema_index(&self, struct_idx: usize) -> usize;
 }
 
-pub(crate) struct DataTypeValidator<'caller, R: Row> {
+#[doc(hidden)]
+pub struct DataTypeValidator<'caller, R: Row> {
     metadata: &'caller RowMetadata,
     current_column_idx: usize,
     _marker: PhantomData<R>,
 }
 
 impl<'caller, R: Row> DataTypeValidator<'caller, R> {
-    pub(crate) fn new(metadata: &'caller RowMetadata) -> Self {
+    pub fn new(metadata: &'caller RowMetadata) -> Self {
         Self {
             metadata,
             current_column_idx: 0,

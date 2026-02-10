@@ -6,7 +6,7 @@ extern crate static_assertions;
 
 pub use self::{
     compression::Compression,
-    row::{Row, RowOwned, RowRead, RowWrite},
+    row::{Row, RowBinaryDecode, RowOwned, RowRead, RowWrite},
 };
 use self::{error::Result, http_client::HttpClient};
 use crate::row_metadata::{AccessType, ColumnDefaultKind, InsertMetadata, RowMetadata};
@@ -38,7 +38,8 @@ mod request_body;
 mod response;
 mod row;
 mod row_metadata;
-mod rowbinary;
+#[doc(hidden)]
+pub mod rowbinary;
 #[cfg(feature = "inserter")]
 mod ticks;
 
@@ -523,7 +524,11 @@ mod formats {
 /// Do not use it in your code directly, it doesn't follow semver.
 #[doc(hidden)]
 pub mod _priv {
+    pub use crate::error::{Error, Result};
     pub use crate::row::RowKind;
+    pub use crate::row_metadata::RowMetadata;
+    pub use crate::rowbinary::RowBinaryDeserializer;
+    pub use crate::rowbinary::validation::DataTypeValidator;
 
     #[cfg(feature = "lz4")]
     pub fn lz4_compress(uncompressed: &[u8]) -> super::Result<bytes::Bytes> {

@@ -18,7 +18,8 @@ pub(crate) enum AccessType {
 /// [`RowMetadata`] should be owned outside the (de)serializer,
 /// as it is calculated only once per struct. It does not have lifetimes,
 /// so it does not introduce a breaking change to [`crate::cursors::RowCursor`].
-pub(crate) struct RowMetadata {
+#[doc(hidden)]
+pub struct RowMetadata {
     /// Database schema, or table columns, are parsed before the first call to deserializer.
     /// However, the order here depends on the usage context:
     /// * For selects, it is defined in the same order as in the database schema.

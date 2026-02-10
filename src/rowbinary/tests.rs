@@ -1,5 +1,8 @@
 use crate::Row;
+use crate::RowBinaryDecode;
+use crate::error::Error;
 use crate::row::Primitive;
+use crate::serde::RawBinaryDecode;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -236,6 +239,43 @@ fn it_serializes_option_time32_some() {
         actual, expected,
         "Option<Time32> (Some) serialization mismatch"
     );
+}
+
+#[derive(Debug, PartialEq)]
+struct FixedRaw(Vec<u8>);
+
+impl RawBinaryDecode for FixedRaw {
+    fn decode_raw(input: &mut &[u8]) -> Result<Self, Error> {
+        const LEN: usize = 3;
+        if input.len() < LEN {
+            return Err(Error::NotEnoughData);
+        }
+        let (value, rest) = input.split_at(LEN);
+        *input = rest;
+        Ok(Self(value.to_vec()))
+    }
+}
+
+#[derive(Debug, PartialEq, Row)]
+#[clickhouse(crate = "crate")]
+struct RawMidRow {
+    prefix: u8,
+    #[clickhouse(raw_binary)]
+    raw: FixedRaw,
+    suffix: u16,
+}
+
+#[test]
+fn it_deserializes_raw_binary_mid_row() {
+    let input = vec![0x2a, 0x01, 0x02, 0x03, 0x34, 0x12];
+    let mut slice = input.as_slice();
+
+    let row = <RawMidRow as RowBinaryDecode>::decode_rowbinary(&mut slice, None).unwrap();
+
+    assert_eq!(row.prefix, 0x2a);
+    assert_eq!(row.raw, FixedRaw(vec![0x01, 0x02, 0x03]));
+    assert_eq!(row.suffix, 0x1234);
+    assert!(slice.is_empty());
 }
 
 #[cfg(feature = "chrono")]

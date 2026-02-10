@@ -3,6 +3,7 @@ use crate::error::{Error, Result};
 use crate::row_metadata::RowMetadata;
 use crate::rowbinary::utils::{ensure_size, get_unsigned_leb128};
 use crate::rowbinary::validation::{DataTypeValidator, SchemaValidator, SerdeType};
+use crate::serde::{RawBinaryDecode, RawBinaryRead};
 use bytes::Buf;
 use core::mem::size_of;
 use serde::de::MapAccess;
@@ -55,7 +56,9 @@ fn deserialize_row_with_validation<'data, 'cursor, T: Deserialize<'data> + Row>(
 /// A deserializer for the `RowBinary(WithNamesAndTypes)` format.
 ///
 /// See https://clickhouse.com/docs/en/interfaces/formats#rowbinary for details.
-struct RowBinaryDeserializer<'cursor, 'data, R: Row, V = ()>
+#[allow(private_bounds)]
+#[doc(hidden)]
+pub struct RowBinaryDeserializer<'cursor, 'data, R: Row, V = ()>
 where
     V: SchemaValidator<R>,
 {
@@ -64,11 +67,12 @@ where
     _marker: PhantomData<R>,
 }
 
+#[allow(private_bounds)]
 impl<'cursor, 'data, R: Row, V> RowBinaryDeserializer<'cursor, 'data, R, V>
 where
     V: SchemaValidator<R>,
 {
-    fn new(input: &'cursor mut &'data [u8], validator: V) -> Self {
+    pub fn new(input: &'cursor mut &'data [u8], validator: V) -> Self {
         Self {
             input,
             validator,
@@ -336,6 +340,26 @@ where
     }
 }
 
+impl<'data, R: Row, Validator> RawBinaryRead<'data>
+    for &mut RowBinaryDeserializer<'_, 'data, R, Validator>
+where
+    Validator: SchemaValidator<R>,
+{
+    fn deserialize_raw_binary<T: RawBinaryDecode>(&mut self) -> Result<T> {
+        T::decode_raw(self.input)
+    }
+}
+
+impl<'data, R: Row, Validator> RawBinaryRead<'data>
+    for RowBinaryDeserializer<'_, 'data, R, Validator>
+where
+    Validator: SchemaValidator<R>,
+{
+    fn deserialize_raw_binary<T: RawBinaryDecode>(&mut self) -> Result<T> {
+        T::decode_raw(self.input)
+    }
+}
+
 /// Used in [`Deserializer::deserialize_seq`], [`Deserializer::deserialize_tuple`],
 /// and it could be used in [`Deserializer::deserialize_struct`],
 /// if we detect that the field order matches the database schema.
@@ -564,5 +588,57 @@ where
             deserializer: self.deserializer,
         };
         Ok((value, deserializer))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RowBinaryDeserializer;
+    use crate::Row;
+    use crate::error::Error;
+    use crate::row::RowKind;
+    use crate::serde::{RawBinaryDecode, RawBinaryRead};
+    use serde::Deserialize;
+
+    #[derive(Debug, PartialEq)]
+    struct FixedRaw(Vec<u8>);
+
+    impl RawBinaryDecode for FixedRaw {
+        fn decode_raw(input: &mut &[u8]) -> Result<Self, Error> {
+            const LEN: usize = 3;
+            if input.len() < LEN {
+                return Err(Error::NotEnoughData);
+            }
+            let (value, rest) = input.split_at(LEN);
+            *input = rest;
+            Ok(Self(value.to_vec()))
+        }
+    }
+
+    struct DummyRow;
+
+    impl Row for DummyRow {
+        const NAME: &'static str = "DummyRow";
+        const COLUMN_NAMES: &'static [&'static str] = &[];
+        const COLUMN_COUNT: usize = 0;
+        const KIND: RowKind = RowKind::Struct;
+
+        type Value<'a> = DummyRow;
+    }
+
+    #[test]
+    fn it_deserializes_raw_binary_mid_row() {
+        let input = vec![0x2a, 0x01, 0x02, 0x03, 0x34, 0x12];
+        let mut slice = input.as_slice();
+        let mut deserializer = RowBinaryDeserializer::<DummyRow, _>::new(&mut slice, ());
+
+        let prefix: u8 = Deserialize::deserialize(&mut deserializer).unwrap();
+        let raw: FixedRaw = RawBinaryRead::deserialize_raw_binary(&mut deserializer).unwrap();
+        let suffix: u16 = Deserialize::deserialize(&mut deserializer).unwrap();
+
+        assert_eq!(prefix, 0x2a);
+        assert_eq!(raw, FixedRaw(vec![0x01, 0x02, 0x03]));
+        assert_eq!(suffix, 0x1234);
+        assert!(slice.is_empty());
     }
 }
