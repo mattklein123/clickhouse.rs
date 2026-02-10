@@ -8,7 +8,6 @@ use crate::{
     error::{Error, Result},
     query_summary::QuerySummary,
     response::Response,
-    rowbinary,
 };
 use bytes::Buf;
 use clickhouse_types::error::TypesError;
@@ -125,10 +124,7 @@ impl<T> RowCursor<T> {
             polonius!(|bytes| -> Poll<Result<Option<T::Value<'polonius>>>> {
                 if bytes.remaining() > 0 {
                     let mut slice = bytes.slice();
-                    let result = rowbinary::deserialize_row::<T::Value<'_>>(
-                        &mut slice,
-                        self.row_metadata.as_ref(),
-                    );
+                    let result = T::decode_rowbinary(&mut slice, self.row_metadata.as_ref());
 
                     match result {
                         Ok(value) => {

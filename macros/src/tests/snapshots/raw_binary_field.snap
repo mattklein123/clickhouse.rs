@@ -1,0 +1,50 @@
+---
+source: derive/src/tests/cases.rs
+---
+#[derive(Row)]
+struct Sample {
+    a: u8,
+    #[clickhouse(raw_binary)]
+    raw: RawPayload,
+    b: u16,
+}
+
+/****** GENERATED ******/
+#[automatically_derived]
+impl clickhouse::Row for Sample {
+    const NAME: &'static str = stringify!(Sample);
+    const COLUMN_NAMES: &'static [&'static str] = &["a", "raw", "b"];
+    const COLUMN_COUNT: usize = <Self as clickhouse::Row>::COLUMN_NAMES.len();
+    const KIND: clickhouse::_priv::RowKind = clickhouse::_priv::RowKind::Struct;
+    type Value<'__v> = Self;
+}
+
+#[automatically_derived]
+impl clickhouse::RowBinaryDecode for Sample {
+    fn decode_rowbinary<'data>(
+        input: &mut &'data [u8],
+        metadata: ::std::option::Option<&clickhouse::_priv::RowMetadata>,
+    ) -> clickhouse::_priv::Result<<Sample as clickhouse::Row>::Value<'data>> {
+        match metadata {
+            Some(metadata) => {
+                let validator = clickhouse::_priv::DataTypeValidator::<Sample>::new(metadata);
+                let mut deserializer =
+                    clickhouse::_priv::RowBinaryDeserializer::<Sample, _>::new(input, validator);
+                let a = ::serde::Deserialize::deserialize(&mut deserializer)?;
+                let raw =
+                    clickhouse::serde::RawBinaryRead::deserialize_raw_binary(&mut deserializer)?;
+                let b = ::serde::Deserialize::deserialize(&mut deserializer)?;
+                Ok(Sample { a, raw, b })
+            }
+            None => {
+                let mut deserializer =
+                    clickhouse::_priv::RowBinaryDeserializer::<Sample, _>::new(input, ());
+                let a = ::serde::Deserialize::deserialize(&mut deserializer)?;
+                let raw =
+                    clickhouse::serde::RawBinaryRead::deserialize_raw_binary(&mut deserializer)?;
+                let b = ::serde::Deserialize::deserialize(&mut deserializer)?;
+                Ok(Sample { a, raw, b })
+            }
+        }
+    }
+}

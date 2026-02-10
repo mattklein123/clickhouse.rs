@@ -49,13 +49,55 @@ fn column_names(data: &DataStruct, cx: &Ctxt, container: &Container) -> Result<T
     })
 }
 
+fn field_has_raw_binary(field: &syn::Field) -> Result<bool> {
+    for attr in &field.attrs {
+        if !attr.path().is_ident("clickhouse") {
+            continue;
+        }
+
+        let mut is_raw_binary = false;
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("raw_binary") {
+                is_raw_binary = true;
+                Ok(())
+            } else {
+                Err(meta.error("unexpected `#[clickhouse(...)]` argument"))
+            }
+        })?;
+
+        if is_raw_binary {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn derives_deserialize(input: &DeriveInput) -> bool {
+    input.attrs.iter().any(|attr| {
+        if !attr.path().is_ident("derive") {
+            return false;
+        }
+
+        let mut has_deserialize = false;
+        let _ = attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("Deserialize") {
+                has_deserialize = true;
+            }
+            Ok(())
+        });
+
+        has_deserialize
+    })
+}
+
 fn row_impl(input: DeriveInput) -> Result<TokenStream> {
     let cx = Ctxt::new();
 
     let Attributes { crate_path } = input.attrs[..].try_into()?;
 
     let container = Container::from_ast(&cx, &input);
-    let name = input.ident;
+    let name = input.ident.clone();
 
     let result = match &input.data {
         Data::Struct(data) if data.fields.is_empty() => {
@@ -94,6 +136,124 @@ fn row_impl(input: DeriveInput) -> Result<TokenStream> {
 
     let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
 
+    let raw_fields = match &input.data {
+        Data::Struct(data) => match &data.fields {
+            Fields::Named(fields) => fields
+                .named
+                .iter()
+                .map(|field| field_has_raw_binary(field))
+                .collect::<Result<Vec<_>>>()?,
+            Fields::Unnamed(fields) => fields
+                .unnamed
+                .iter()
+                .map(|field| field_has_raw_binary(field))
+                .collect::<Result<Vec<_>>>()?,
+            Fields::Unit => vec![],
+        },
+        _ => vec![],
+    };
+
+    let has_raw_binary = raw_fields.iter().any(|value| *value);
+
+    if has_raw_binary && derives_deserialize(&input) {
+        return Err(Error::new(
+            name.span(),
+            "`Row` with #[clickhouse(raw_binary)] cannot derive `Deserialize`",
+        ));
+    }
+
+    let rowbinary_decode_impl = if has_raw_binary {
+        let (fields, field_is_raw): (Vec<_>, Vec<_>) = match &input.data {
+            Data::Struct(data) => match &data.fields {
+                Fields::Named(fields) => (
+                    fields
+                        .named
+                        .iter()
+                        .map(|field| field.ident.clone().expect("named field"))
+                        .collect(),
+                    raw_fields.clone(),
+                ),
+                Fields::Unnamed(_) => {
+                    return Err(Error::new(
+                        name.span(),
+                        "raw binary fields are not supported in tuple structs",
+                    ));
+                }
+                Fields::Unit => {
+                    return Err(Error::new(
+                        name.span(),
+                        "raw binary fields are not supported in unit structs",
+                    ));
+                }
+            },
+            _ => (Vec::new(), Vec::new()),
+        };
+
+        let deserialize_fields: Vec<_> = fields
+            .iter()
+            .zip(field_is_raw.iter())
+            .map(|(field, is_raw)| {
+                if *is_raw {
+                    quote! {
+                        let #field = #crate_path::serde::RawBinaryRead::deserialize_raw_binary(&mut deserializer)?;
+                    }
+                } else {
+                    quote! {
+                        let #field = ::serde::Deserialize::deserialize(&mut deserializer)?;
+                    }
+                }
+            })
+            .collect();
+
+        let construct = match &input.data {
+            Data::Struct(DataStruct {
+                fields: Fields::Named(_),
+                ..
+            }) => {
+                quote! { #name { #( #fields, )* } }
+            }
+            Data::Struct(DataStruct {
+                fields: Fields::Unnamed(_),
+                ..
+            }) => {
+                quote! { #name( #( #fields, )* ) }
+            }
+            _ => quote! { #name },
+        };
+
+        quote! {
+            #[automatically_derived]
+            impl #impl_generics #crate_path::RowBinaryDecode for #name #ty_generics #where_clause {
+                fn decode_rowbinary<'data>(
+                    input: &mut &'data [u8],
+                    metadata: ::std::option::Option<&#crate_path::_priv::RowMetadata>,
+                ) -> #crate_path::_priv::Result<<#name #ty_generics as #crate_path::Row>::Value<'data>> {
+                    match metadata {
+                        Some(metadata) => {
+                            let validator = #crate_path::_priv::DataTypeValidator::<#name #ty_generics>::new(metadata);
+                            let mut deserializer = #crate_path::_priv::RowBinaryDeserializer::<#name #ty_generics, _>::new(
+                                input,
+                                validator,
+                            );
+                            #( #deserialize_fields )*
+                            Ok(#construct)
+                        }
+                        None => {
+                            let mut deserializer = #crate_path::_priv::RowBinaryDeserializer::<#name #ty_generics, _>::new(
+                                input,
+                                (),
+                            );
+                            #( #deserialize_fields )*
+                            Ok(#construct)
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     Ok(quote! {
         #[automatically_derived]
         impl #impl_generics #crate_path::Row for #name #ty_generics #where_clause {
@@ -104,5 +264,7 @@ fn row_impl(input: DeriveInput) -> Result<TokenStream> {
 
             type Value<'__v> = #value;
         }
+
+        #rowbinary_decode_impl
     })
 }
