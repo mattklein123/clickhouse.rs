@@ -9,7 +9,9 @@ use std::ops::Index;
 use hashbrown::HashMap;
 
 pub use array::{ArrayData, ArrayReader};
+pub use clickhouse_macros::NativeRow;
 pub use reader::BlockReadError;
+pub use row::NativeRow;
 
 use crate::native::decode::Decode;
 pub use clickhouse_types::DataTypeNode;
@@ -19,6 +21,7 @@ pub mod builder;
 pub mod decode;
 pub mod encode;
 pub(crate) mod reader;
+pub mod row;
 pub(crate) mod string;
 mod utils;
 mod varuint;
@@ -128,6 +131,9 @@ enum LayoutKind {
         // so we save 24 bytes per string by linearizing the string data and storing offsets,
         // assuming many small strings instead of fewer big ones, which also amortizes allocations
         data: Bytes,
+    },
+    Chunked {
+        chunks: Box<[Bytes]>,
     },
     /// Layout determined by `LowCardinality` metadata.
     LowCardinality(LayoutLowCardinality),

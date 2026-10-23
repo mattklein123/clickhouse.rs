@@ -3,7 +3,7 @@
 use crate::error::BoxedError;
 use crate::native::builder::{LayoutBuilder, LayoutBuilderKind};
 use crate::native::utils::DebugNullMap;
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use clickhouse_types::DataTypeNode;
 use std::cmp;
 use std::collections::{BTreeMap, HashMap};
@@ -156,6 +156,11 @@ impl<'a> ValueWriter<'a> {
     /// Types writing to a `FixedString` column should check the declared length through
     /// [`Self::column_type()`] and call [`Self::write_fixed()`] instead.
     pub fn write_string(&mut self, string_bytes: &[u8]) -> Result<(), ValueWriteError> {
+        if let LayoutBuilderKind::Chunked { chunks } = &mut self.layout.kind {
+            chunks.push(bytes::Bytes::copy_from_slice(string_bytes));
+            self.write_not_null();
+            return Ok(());
+        }
         let LayoutBuilderKind::Variable { end_offsets, data } = &mut self.layout.kind else {
             return Err(ValueWriteError::IncorrectMethod);
         };
@@ -819,7 +824,11 @@ impl Encode for str {
     }
 
     fn encode(&self, writer: &mut ValueWriter<'_>) -> Result<(), BoxedError> {
-        if let DataTypeNode::FixedString(fixed_len) = writer.data_type {
+        let mut data_type = writer.data_type.remove_simple_aggregate_function();
+        if let DataTypeNode::Nullable(inner) = data_type {
+            data_type = inner.remove_simple_aggregate_function();
+        }
+        if let DataTypeNode::FixedString(fixed_len) = data_type {
             if self.len() != *fixed_len {
                 // Give a more informative error
                 return Err(format!(
@@ -858,6 +867,16 @@ impl Encode for String {
 
     fn compatible(column_type: &DataTypeNode) -> bool {
         str::compatible(column_type)
+    }
+}
+
+impl Encode for Bytes {
+    fn produces() -> DataTypeNode {
+        DataTypeNode::String
+    }
+
+    fn encode(&self, writer: &mut ValueWriter<'_>) -> Result<(), BoxedError> {
+        Ok(writer.write_string(self)?)
     }
 }
 

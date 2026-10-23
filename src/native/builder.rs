@@ -4,7 +4,7 @@ use crate::native::encode::{Encode, ValueWriter};
 use crate::native::string::MaybeUtf8;
 use crate::native::utils::{DebugFixedData, DebugNullMap, DebugVariableData, type_fixed_width};
 use crate::native::{Block, Column, Layout, LayoutKind};
-use bytes::{BufMut, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use clickhouse_types::DataTypeNode;
 use hashbrown::{HashMap, hash_map};
 use std::collections::VecDeque;
@@ -128,11 +128,96 @@ impl BlockBuilder {
             })
     }
 
+    /// Add or append to a top-level column of pre-serialized aggregate states.
+    ///
+    /// `data_type` must be the complete `AggregateFunction(...)` type, including its parameters.
+    /// Each value must already use that function's ClickHouse binary state serialization.
+    /// The client validates the column type and row count, but not the opaque state payloads.
+    /// Nullable and nested aggregate columns are not supported by this API.
+    pub fn upsert_aggregate_column(
+        &mut self,
+        name: impl Into<String>,
+        data_type: DataTypeNode,
+    ) -> Result<AggregateColumnBuilder<'_>, UpsertColumnError> {
+        let name = name.into();
+        if !matches!(data_type, DataTypeNode::AggregateFunction(_, _)) {
+            return Err(UpsertColumnError::UnsupportedType {
+                column_name: name.into(),
+                data_type: data_type.into(),
+            });
+        }
+
+        self.upsert_column_with_layout(name, data_type, |_, _| {
+            Ok(LayoutBuilder {
+                kind: LayoutBuilderKind::Variable {
+                    end_offsets: Vec::new(),
+                    data: BytesMut::new(),
+                },
+                nulls: None,
+            })
+        })
+        .map(|inner| AggregateColumnBuilder { inner })
+    }
+
+    /// Add owned `String` values or pre-serialized `AggregateFunction` states without copying.
+    ///
+    /// Each value retains its allocation until the block is dropped. Aggregate states must
+    /// already use the exact function's binary state serialization; their payloads are opaque.
+    /// Nullable and nested columns are not supported by this method.
+    pub fn upsert_bytes_column(
+        &mut self,
+        name: impl Into<String>,
+        data_type: DataTypeNode,
+    ) -> Result<BytesColumnBuilder<'_>, UpsertColumnError> {
+        let name = name.into();
+        if !matches!(
+            data_type,
+            DataTypeNode::String | DataTypeNode::AggregateFunction(_, _)
+        ) {
+            return Err(UpsertColumnError::UnsupportedType {
+                column_name: name.into(),
+                data_type: data_type.into(),
+            });
+        }
+        let inner = self.upsert_column_with_layout(name, data_type, |_, _| {
+            Ok(LayoutBuilder {
+                kind: LayoutBuilderKind::Chunked { chunks: Vec::new() },
+                nulls: None,
+            })
+        })?;
+        if let LayoutBuilderKind::Variable { end_offsets, data } = &mut inner.layout.kind {
+            let data = mem::take(data).freeze();
+            let mut start = 0;
+            let chunks = mem::take(end_offsets)
+                .into_iter()
+                .map(|end| {
+                    let value = data.slice(start..end);
+                    start = end;
+                    value
+                })
+                .collect();
+            inner.layout.kind = LayoutBuilderKind::Chunked { chunks };
+        }
+        Ok(BytesColumnBuilder { inner })
+    }
+
     fn upsert_column_with(
         &mut self,
         name: impl Into<String>,
         data_type: DataTypeNode,
     ) -> Result<&mut ColumnBuilderRaw, UpsertColumnError> {
+        self.upsert_column_with_layout(name, data_type, LayoutBuilder::new)
+    }
+
+    fn upsert_column_with_layout<F>(
+        &mut self,
+        name: impl Into<String>,
+        data_type: DataTypeNode,
+        new_layout: F,
+    ) -> Result<&mut ColumnBuilderRaw, UpsertColumnError>
+    where
+        F: FnOnce(&MaybeUtf8, &DataTypeNode) -> Result<LayoutBuilder, UpsertColumnError>,
+    {
         let data_type = erase_wrappers(data_type);
 
         match self.column_names.entry(MaybeUtf8::from_string(name)) {
@@ -151,7 +236,7 @@ impl BlockBuilder {
             }
             hash_map::Entry::Vacant(vacant) => {
                 let col = ColumnBuilderRaw {
-                    layout: LayoutBuilder::new(vacant.key(), &data_type)?,
+                    layout: new_layout(vacant.key(), &data_type)?,
                     data_type,
                     name: vacant.key().clone(),
                 };
@@ -300,6 +385,88 @@ impl<T> Debug for ColumnBuilder<'_, T> {
     }
 }
 
+/// Builder for opaque, pre-serialized `AggregateFunction` states.
+pub struct AggregateColumnBuilder<'a> {
+    inner: &'a mut ColumnBuilderRaw,
+}
+
+impl AggregateColumnBuilder<'_> {
+    /// The number of states added to this column.
+    pub fn num_values(&self) -> usize {
+        self.inner.num_values()
+    }
+
+    /// Append one complete state, without adding any wire framing.
+    pub fn add(&mut self, state: &[u8]) -> &mut Self {
+        match &mut self.inner.layout.kind {
+            LayoutBuilderKind::Variable { end_offsets, data } => {
+                data.extend_from_slice(state);
+                end_offsets.push(data.len());
+            }
+            LayoutBuilderKind::Chunked { chunks } => chunks.push(Bytes::copy_from_slice(state)),
+            _ => unreachable!("aggregate column must have a byte layout"),
+        }
+        self
+    }
+
+    /// Append complete states from an iterator.
+    pub fn add_all<I>(&mut self, states: I) -> &mut Self
+    where
+        I: IntoIterator,
+        I::Item: AsRef<[u8]>,
+    {
+        let states = states.into_iter();
+        self.inner.layout.reserve(states.size_hint().0);
+        for state in states {
+            self.add(state.as_ref());
+        }
+        self
+    }
+}
+
+impl Debug for AggregateColumnBuilder<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
+/// Builder for owned strings or opaque aggregate states, retaining each value without copying.
+pub struct BytesColumnBuilder<'a> {
+    inner: &'a mut ColumnBuilderRaw,
+}
+
+impl BytesColumnBuilder<'_> {
+    /// The number of values in this column.
+    pub fn num_values(&self) -> usize {
+        self.inner.num_values()
+    }
+
+    /// Move a complete value into the column without copying its bytes.
+    pub fn add(&mut self, value: Bytes) -> &mut Self {
+        let LayoutBuilderKind::Chunked { chunks } = &mut self.inner.layout.kind else {
+            unreachable!("owned byte column must have a chunked layout")
+        };
+        chunks.push(value);
+        self
+    }
+
+    /// Move values into this column, reserving metadata from the iterator's size hint.
+    pub fn add_all(&mut self, values: impl IntoIterator<Item = Bytes>) -> &mut Self {
+        let values = values.into_iter();
+        self.inner.layout.reserve(values.size_hint().0);
+        for value in values {
+            self.add(value);
+        }
+        self
+    }
+}
+
+impl Debug for BytesColumnBuilder<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
+}
+
 #[derive(Debug)] // Derived impl works for us here
 pub(super) struct ColumnBuilderRaw {
     name: MaybeUtf8,
@@ -368,6 +535,9 @@ pub(super) enum LayoutBuilderKind {
         // so we save 24 bytes per string by linearizing the string data and storing offsets,
         // assuming many small strings instead of fewer big ones, which also amortizes allocations
         data: BytesMut,
+    },
+    Chunked {
+        chunks: Vec<Bytes>,
     },
     /// Array data. Element data governed by `elem_layout`.
     Array {
@@ -454,6 +624,7 @@ impl LayoutBuilder {
         match &self.kind {
             LayoutBuilderKind::Fixed { type_width, data } => data.len() / type_width,
             LayoutBuilderKind::Variable { end_offsets, .. } => end_offsets.len(),
+            LayoutBuilderKind::Chunked { chunks } => chunks.len(),
             LayoutBuilderKind::Array { end_indices, .. } => end_indices.len(),
             LayoutBuilderKind::Tuple { layouts, .. } => {
                 layouts.first().map_or(0, |layout| layout.num_values())
@@ -463,6 +634,9 @@ impl LayoutBuilder {
     }
 
     pub(super) fn reserve(&mut self, additional: usize) {
+        if let Some(nulls) = &mut self.nulls {
+            nulls.reserve(additional);
+        }
         match &mut self.kind {
             LayoutBuilderKind::Fixed { type_width, data } => {
                 data.reserve(type_width.saturating_mul(additional));
@@ -471,9 +645,16 @@ impl LayoutBuilder {
                 end_offsets.reserve(additional);
                 // Don't reserve in `data` because we don't know the total additional size
             }
-            LayoutBuilderKind::Array { .. } => {}
-            LayoutBuilderKind::Tuple { .. } => {}
-            LayoutBuilderKind::Map { .. } => {}
+            LayoutBuilderKind::Chunked { chunks } => chunks.reserve(additional),
+            LayoutBuilderKind::Array { end_indices, .. }
+            | LayoutBuilderKind::Map { end_indices, .. } => {
+                end_indices.reserve(additional);
+            }
+            LayoutBuilderKind::Tuple { layouts } => {
+                for layout in layouts {
+                    layout.reserve(additional);
+                }
+            }
         }
     }
 
@@ -486,6 +667,7 @@ impl LayoutBuilder {
             LayoutBuilderKind::Variable { end_offsets, data } => {
                 end_offsets.push(data.len());
             }
+            LayoutBuilderKind::Chunked { chunks } => chunks.push(Bytes::new()),
             LayoutBuilderKind::Array { end_indices, .. } => {
                 let end_index = end_indices.last().copied().unwrap_or(0);
                 end_indices.push(end_index);
@@ -507,6 +689,9 @@ impl LayoutBuilder {
     ///
     /// For arrays and maps, this truncates to the length of the array at `num_values`.
     pub(super) fn truncate(&mut self, num_values: usize) {
+        if let Some(nulls) = &mut self.nulls {
+            nulls.truncate(num_values);
+        }
         match &mut self.kind {
             LayoutBuilderKind::Fixed { type_width, data } => {
                 data.truncate(type_width.saturating_mul(num_values));
@@ -517,6 +702,7 @@ impl LayoutBuilder {
                 let last_offset = end_offsets.last().copied().unwrap_or(0);
                 data.truncate(last_offset);
             }
+            LayoutBuilderKind::Chunked { chunks } => chunks.truncate(num_values),
             LayoutBuilderKind::Array {
                 end_indices,
                 elem_layout,
@@ -585,6 +771,17 @@ impl LayoutBuilder {
                     }
                 }
 
+                Ok(())
+            }
+            LayoutBuilderKind::Chunked { .. } => {
+                if !matches!(
+                    non_nullable,
+                    DataTypeNode::String | DataTypeNode::AggregateFunction(_, _)
+                ) {
+                    return Err(format!(
+                        "expected String or AggregateFunction, got {non_nullable}"
+                    ));
+                }
                 Ok(())
             }
             LayoutBuilderKind::Array {
@@ -719,6 +916,9 @@ impl LayoutBuilder {
                     end_offsets: end_offsets.into(),
                     data: data.freeze(),
                 },
+                LayoutBuilderKind::Chunked { chunks } => LayoutKind::Chunked {
+                    chunks: chunks.into(),
+                },
                 LayoutBuilderKind::Array {
                     end_indices,
                     elem_layout,
@@ -771,6 +971,7 @@ impl Debug for LayoutBuilderKind {
                 .debug_struct("Variable")
                 .field("data", &DebugVariableData { end_offsets, data })
                 .finish(),
+            Chunked { chunks } => f.debug_struct("Chunked").field("chunks", chunks).finish(),
             Array {
                 elem_layout,
                 end_indices,

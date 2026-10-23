@@ -223,7 +223,7 @@ impl<'a> Decode<'a> for String {
 
 impl<'a, T: Decode<'a>> Decode<'a> for Option<T> {
     fn compatible(data_type: &DataTypeNode) -> bool {
-        if let DataTypeNode::Nullable(inner) = data_type {
+        if let DataTypeNode::Nullable(inner) = data_type.remove_simple_aggregate_function() {
             T::compatible(inner)
         } else {
             false
@@ -231,7 +231,9 @@ impl<'a, T: Decode<'a>> Decode<'a> for Option<T> {
     }
 
     fn decode(reader: &mut ValueReader<'a>) -> Result<Self, BoxedError> {
-        let DataTypeNode::Nullable(inner_type) = reader.data_type else {
+        let DataTypeNode::Nullable(inner_type) =
+            reader.data_type.remove_simple_aggregate_function()
+        else {
             return Err(format!("expected `Nullable(_)`, got {:?}", reader.data_type).into());
         };
 
@@ -412,7 +414,7 @@ impl Decode<'_> for IpAddr {
     }
 
     fn decode(reader: &mut ValueReader<'_>) -> Result<Self, BoxedError> {
-        match reader.data_type {
+        match reader.data_type.remove_simple_aggregate_function() {
             DataTypeNode::IPv4 => Ipv4Addr::decode(reader).map(Into::into),
             DataTypeNode::IPv6 => Ipv6Addr::decode(reader).map(Into::into),
             other => Err(format!("expected IP address, got {other}").into()),

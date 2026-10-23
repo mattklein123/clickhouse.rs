@@ -12,6 +12,10 @@ use std::collections::VecDeque;
 use std::fmt::{Display, Formatter};
 use std::ops::ControlFlow;
 
+#[cfg(test)]
+#[path = "reader_test.rs"]
+mod tests;
+
 pub(crate) struct BlockReader {
     inner: ReaderInner,
     // Since versioned type encoding is split into a "prefix phase" and a "data phase"
@@ -152,7 +156,7 @@ impl BlockReader {
         column_name: &MaybeUtf8,
         data_type: &DataTypeNode,
     ) -> Result<(), Error> {
-        match data_type {
+        match data_type.remove_simple_aggregate_function() {
             DataTypeNode::LowCardinality(_) => {
                 let prefix = self.inner.read_int64().await?;
 
@@ -168,7 +172,7 @@ impl BlockReader {
                 self.prefix_queue.push_back(StatePrefix::LowCardinality);
             }
             // State prefix for composite types needs to be read _before_ the composite type layout
-            DataTypeNode::Array(inner_type) => {
+            DataTypeNode::Array(inner_type) | DataTypeNode::Nullable(inner_type) => {
                 Box::pin(self.read_state_prefix(column_name, inner_type)).await?;
             }
             DataTypeNode::Tuple(types) => {
@@ -210,9 +214,13 @@ impl BlockReader {
             .into());
         }
 
+        let data_type = data_type.remove_simple_aggregate_function();
         let (data_type, nulls) = if let DataTypeNode::Nullable(inner) = data_type {
             // Read off the null bitmap
-            (&**inner, Some(self.inner.read_bytes(num_values).await?))
+            (
+                inner.remove_simple_aggregate_function(),
+                Some(self.inner.read_bytes(num_values).await?),
+            )
         } else {
             (data_type, None)
         };
@@ -236,7 +244,7 @@ impl BlockReader {
             DataTypeNode::String => {
                 // Assume default growth strategy is fine
                 let mut data = BytesMut::new();
-                let mut end_offsets = Vec::with_capacity(num_values);
+                let mut end_offsets = Vec::new();
 
                 for row in 0..num_values {
                     let len = self.inner.read_varuint().await?;
@@ -436,7 +444,10 @@ impl BlockReader {
             .into());
         }
 
-        let keys = self.inner.read_lc_keys(key_type, num_rows).await?;
+        let keys = self
+            .inner
+            .read_lc_keys(key_type, num_rows, dict_len)
+            .await?;
 
         Ok(LayoutLowCardinality {
             keys,
@@ -479,7 +490,8 @@ impl ReaderInner {
     }
 
     async fn read_array_indices(&mut self, num_rows: usize) -> Result<Box<[usize]>, Error> {
-        let mut end_indices = Vec::with_capacity(num_rows);
+        let mut end_indices = Vec::new();
+        let mut previous = 0;
 
         for _ in 0..num_rows {
             // Note: cumulative length, last value is total number of elements
@@ -488,7 +500,11 @@ impl ReaderInner {
             let length = usize::try_from(length)
                 .map_err(|_| read_error!("array length out of range: {length}"))?;
 
+            if length < previous || length > SAFE_ALLOCATION_LIMIT {
+                return Err(read_error!("invalid array offset: {length} after {previous}").into());
+            }
             end_indices.push(length);
+            previous = length;
         }
 
         Ok(end_indices.into())
@@ -498,8 +514,9 @@ impl ReaderInner {
         &mut self,
         key_type: LcKeyType,
         num_rows: usize,
+        dict_len: usize,
     ) -> Result<Box<[usize]>, Error> {
-        let mut keys = Vec::with_capacity(num_rows);
+        let mut keys = Vec::new();
 
         for i in 0..num_rows {
             let mut buf = [0u8; LcKeyType::MAX_BYTE_WIDTH];
@@ -515,6 +532,12 @@ impl ReaderInner {
                 )
             })?;
 
+            if key >= dict_len {
+                return Err(read_error!(
+                    "LowCardinality dictionary key out of bounds at index {i}: {key} vs {dict_len}"
+                )
+                .into());
+            }
             keys.push(key);
         }
 
@@ -522,6 +545,12 @@ impl ReaderInner {
     }
 
     async fn read_bytes(&mut self, len: usize) -> Result<Bytes, Error> {
+        if len > SAFE_ALLOCATION_LIMIT {
+            return Err(read_error!(
+                "safe allocation limit exceeded: {len} vs {SAFE_ALLOCATION_LIMIT}"
+            )
+            .into());
+        }
         if len == 0 {
             return Ok(Bytes::new());
         }

@@ -8,9 +8,17 @@ use serde_derive_internals::{
 use syn::{Data, DataStruct, DeriveInput, Error, Fields, Lifetime, Result, parse_macro_input};
 
 mod attributes;
+mod native_row;
 
 #[cfg(test)]
 mod tests;
+
+#[proc_macro_derive(NativeRow, attributes(native, serde, clickhouse))]
+pub fn native_row(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    native_row::derive(parse_macro_input!(input as DeriveInput))
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
 
 // TODO: support wrappers `Wrapper(Inner)` and `Wrapper<T>(T)`.
 // TODO: support the `nested` attribute.

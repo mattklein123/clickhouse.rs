@@ -1,5 +1,6 @@
 use crate::error::Error;
 use crate::native::{Layout, LayoutKind, LayoutLowCardinality};
+use bytes::Bytes;
 use clickhouse_types::DataTypeNode;
 use std::marker::PhantomData;
 use std::ops::Range;
@@ -38,6 +39,7 @@ pub struct TupleIter<'a> {
 
 enum IterKind<'a> {
     Fixed(slice::ChunksExact<'a, u8>),
+    Chunked(slice::Iter<'a, Bytes>),
     Variable {
         next_start: usize,
         end_indices: slice::Iter<'a, usize>,
@@ -116,6 +118,9 @@ impl<'a> ArrayData<'a> {
                     data[self.indices.start * type_width..self.indices.end * type_width]
                         .chunks_exact(type_width),
                 ),
+                LayoutKind::Chunked { ref chunks } => {
+                    IterKind::Chunked(chunks[self.indices.clone()].iter())
+                }
                 LayoutKind::Variable {
                     end_offsets: ref end_indices,
                     ref data,
@@ -208,6 +213,17 @@ where
         }
 
         match &mut self.kind {
+            IterKind::Chunked(iter) => {
+                let native_bytes = iter.next()?;
+                check_null!();
+                Some(
+                    T::decode(&mut ValueReader {
+                        data_type: self.elem_type,
+                        native_bytes,
+                    })
+                    .map_err(Error::Other),
+                )
+            }
             IterKind::Fixed(iter) => {
                 let native_bytes = iter.next()?;
 
@@ -347,6 +363,7 @@ where
 
     fn size_hint(&self) -> (usize, Option<usize>) {
         match &self.kind {
+            IterKind::Chunked(chunks) => chunks.size_hint(),
             IterKind::Fixed(chunks) => chunks.size_hint(),
             IterKind::Variable { end_indices, .. } => end_indices.size_hint(),
             IterKind::Array { end_indices, .. } => end_indices.size_hint(),

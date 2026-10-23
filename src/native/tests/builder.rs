@@ -1,6 +1,174 @@
+use crate::native::LayoutKind;
 use crate::native::builder::{BlockBuilder, BlockBuilderError, UpsertColumnError};
+use crate::native::encode::{Encode, ValueWriter};
+use bytes::Bytes;
 use clickhouse_types::DataTypeNode;
 use std::collections::BTreeMap;
+
+#[test]
+fn aborted_nullable_array_restores_null_bitmap() {
+    struct AbortedArray;
+
+    impl Encode for AbortedArray {
+        fn produces() -> DataTypeNode {
+            Vec::<Option<u8>>::produces()
+        }
+
+        fn encode(
+            &self,
+            writer: &mut ValueWriter<'_>,
+        ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            writer.write_array()?.write(Some(42u8))?;
+            Ok(())
+        }
+    }
+
+    let mut builder = BlockBuilder::new();
+    builder
+        .upsert_column("x")
+        .unwrap()
+        .add(vec![Some(7u8)])
+        .unwrap();
+    builder
+        .upsert_column("x")
+        .unwrap()
+        .add(AbortedArray)
+        .unwrap();
+    builder
+        .upsert_column("x")
+        .unwrap()
+        .add(vec![None, Some(9u8)])
+        .unwrap();
+    let block = builder.build().unwrap();
+    let values = block["x"]
+        .iter::<Vec<Option<u8>>>()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(values, vec![vec![Some(7)], vec![None, Some(9)]]);
+}
+
+#[test]
+fn owned_columns_retain_allocations_and_allow_borrowed_appends() {
+    let value = Bytes::from(vec![b'x'; 1024]);
+    let pointer = value.as_ptr();
+    let mut builder = BlockBuilder::new();
+    builder
+        .upsert_column("value")
+        .unwrap()
+        .add("prefix")
+        .unwrap();
+    builder
+        .upsert_bytes_column("value", DataTypeNode::String)
+        .unwrap()
+        .add(value);
+    builder
+        .upsert_column("value")
+        .unwrap()
+        .add("suffix")
+        .unwrap();
+    let data_type = DataTypeNode::AggregateFunction("sum".into(), vec![DataTypeNode::UInt64]);
+    let state = Bytes::from(vec![1u8; 8]);
+    let state_pointer = state.as_ptr();
+    builder
+        .upsert_bytes_column("state", data_type.clone())
+        .unwrap()
+        .add_all([state, Bytes::from_static(&[0; 8])]);
+    builder
+        .upsert_aggregate_column("state", data_type)
+        .unwrap()
+        .add(&[2; 8]);
+    let block = builder.build().unwrap();
+    assert_eq!(block.num_rows(), 3);
+    let values = block["value"]
+        .iter::<&str>()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(values[0], "prefix");
+    assert_eq!(values[1].as_ptr(), pointer);
+    assert_eq!(values[2], "suffix");
+    let LayoutKind::Chunked { chunks } = &block["state"].layout.kind else {
+        panic!("expected owned state storage");
+    };
+    assert_eq!(chunks[0].as_ptr(), state_pointer);
+    assert!(matches!(
+        BlockBuilder::new().upsert_bytes_column("x", DataTypeNode::UInt64),
+        Err(UpsertColumnError::UnsupportedType { .. })
+    ));
+}
+
+#[test]
+fn aggregate_states_preserve_type_and_row_boundaries() {
+    let data_type =
+        DataTypeNode::AggregateFunction("uniqCombined(14)".into(), vec![DataTypeNode::String]);
+    let mut builder = BlockBuilder::new();
+    builder
+        .upsert_column("id")
+        .unwrap()
+        .add_all([1u64, 2])
+        .unwrap();
+    let mut column = builder
+        .upsert_aggregate_column("state", data_type.clone())
+        .unwrap();
+    column.add_all([&[0u8][..], &[1, 2, 3, 4, 5]]);
+    assert_eq!(column.num_values(), 2);
+    let block = builder.build().unwrap();
+    assert_eq!(block.num_rows(), 2);
+    assert_eq!(block["state"].data_type(), &data_type);
+    let LayoutKind::Variable { end_offsets, data } = &block["state"].layout.kind else {
+        panic!("expected variable-length state storage")
+    };
+    assert_eq!(&**end_offsets, &[1, 6]);
+    assert_eq!(&data[..], &[0, 1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn aggregate_states_reject_wrong_types_and_lengths() {
+    let mut builder = BlockBuilder::new();
+    for data_type in [
+        DataTypeNode::String,
+        DataTypeNode::Nullable(Box::new(DataTypeNode::AggregateFunction(
+            "sum".into(),
+            vec![DataTypeNode::UInt64],
+        ))),
+        DataTypeNode::Array(Box::new(DataTypeNode::AggregateFunction(
+            "sum".into(),
+            vec![DataTypeNode::UInt64],
+        ))),
+    ] {
+        assert!(matches!(
+            builder.upsert_aggregate_column("state", data_type),
+            Err(UpsertColumnError::UnsupportedType { .. })
+        ));
+    }
+    builder
+        .upsert_column("id")
+        .unwrap()
+        .add_all([1u64, 2])
+        .unwrap();
+    let data_type = DataTypeNode::AggregateFunction("sum".into(), vec![DataTypeNode::UInt64]);
+    builder
+        .upsert_aggregate_column("state", data_type.clone())
+        .unwrap()
+        .add(&1u64.to_le_bytes());
+    assert!(matches!(
+        builder.build(),
+        Err(BlockBuilderError::MismatchedLengths { .. })
+    ));
+    assert!(matches!(
+        builder.upsert_aggregate_column(
+            "state",
+            DataTypeNode::AggregateFunction("max".into(), vec![DataTypeNode::UInt64])
+        ),
+        Err(UpsertColumnError::ColumnExists { .. })
+    ));
+    builder
+        .upsert_aggregate_column("state", data_type)
+        .unwrap()
+        .add(&2u64.to_le_bytes());
+    assert_eq!(builder.build().unwrap().num_rows(), 2);
+}
 
 #[test]
 fn forbids_incompatible_upsert() {

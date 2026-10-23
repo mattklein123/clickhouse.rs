@@ -7,6 +7,35 @@ use std::collections::HashMap;
 use std::mem;
 
 #[test]
+fn encodes_nullable_fixed_string() {
+    struct FixedString(Option<&'static str>);
+
+    impl Encode for FixedString {
+        fn produces() -> DataTypeNode {
+            DataTypeNode::Nullable(Box::new(DataTypeNode::FixedString(3)))
+        }
+
+        fn encode(&self, writer: &mut ValueWriter<'_>) -> Result<(), BoxedError> {
+            self.0.encode(writer)
+        }
+    }
+
+    let mut builder = BlockBuilder::new();
+    builder
+        .upsert_column("x")
+        .unwrap()
+        .add_all([FixedString(Some("abc")), FixedString(None)])
+        .unwrap();
+    let block = builder.build().unwrap();
+    let values = block["x"]
+        .iter::<Option<&str>>()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(values, vec![Some("abc"), None]);
+}
+
+#[test]
 fn array_writer_rolls_back() {
     struct BadArray<'a>(&'a [u32]);
 

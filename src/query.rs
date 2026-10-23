@@ -187,7 +187,7 @@ impl Query {
         Ok(BytesCursor::new(response, span.exit()))
     }
 
-    pub fn fetch_native(mut self) -> Result<NativeCursor> {
+    pub fn fetch_native(self) -> Result<NativeCursor> {
         let span = self.make_span(Some("Native")).entered();
 
         let client_protocol_version = self.client.settings.get(CLIENT_PROTOCOL_VERSION);
@@ -207,9 +207,6 @@ impl Query {
                  please set this setting to \"0\" or leave it unset"
             ).into()));
         }
-
-        // FIXME: use HTTP body compression instead of block-level compression
-        self.client = self.client.with_compression(Compression::None);
 
         let response = self.do_execute(Some("Native"))?;
 
@@ -426,6 +423,39 @@ impl Query {
 mod tests {
     use crate::error::Error;
     use crate::{Client, settings};
+
+    #[cfg(all(feature = "test-util", feature = "lz4"))]
+    #[tokio::test]
+    async fn native_reads_preserve_http_compression() {
+        use crate::Compression;
+        use crate::test::{Mock, handlers};
+
+        #[cfg(not(feature = "zstd"))]
+        let compressions = [(Compression::None, None), (Compression::Lz4, Some("lz4"))];
+        #[cfg(feature = "zstd")]
+        let compressions = [
+            (Compression::None, None),
+            (Compression::Lz4, Some("lz4")),
+            (Compression::zstd(), Some("zstd")),
+        ];
+        for (compression, expected_encoding) in compressions {
+            let mock = Mock::new();
+            let recorded = mock.add(handlers::record_request());
+            let client = Client::default()
+                .with_url(mock.real_url())
+                .with_compression(compression);
+            let mut cursor = client.query("SELECT 1").fetch_native().unwrap();
+            assert!(cursor.next().await.unwrap().is_none());
+            let request = recorded.request().await;
+            assert_eq!(
+                request
+                    .headers()
+                    .get("accept-encoding")
+                    .map(|value| value.to_str().unwrap()),
+                expected_encoding,
+            );
+        }
+    }
 
     #[test]
     fn fetch_native_errors_nonzero_client_protocol_version() {

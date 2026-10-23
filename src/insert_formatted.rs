@@ -18,6 +18,10 @@ use tokio::{
 };
 use url::Url;
 
+#[cfg(all(test, feature = "lz4"))]
+#[path = "insert_formatted_test.rs"]
+mod tests;
+
 #[cfg(any(feature = "lz4", feature = "zstd"))]
 pub use compression::CompressedData;
 
@@ -352,6 +356,17 @@ impl InsertFormatted {
         };
 
         self.send_inner(data, original_size).await
+    }
+
+    pub(crate) async fn send_buffer(&mut self, buffer: &mut BytesMut) -> Result<()> {
+        #[cfg(any(feature = "lz4", feature = "zstd"))]
+        if self.compression.is_enabled() {
+            let data = CompressedData::new(buffer, self.compression)?;
+            buffer.clear();
+            return self.send_compressed(data).await;
+        }
+
+        self.send(buffer.split().freeze()).await
     }
 
     async fn send_inner(&mut self, mut data: Bytes, original_size: u64) -> Result<()> {

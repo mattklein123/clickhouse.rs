@@ -4,7 +4,7 @@
 use crate::insert_formatted::InsertFormatted;
 use crate::native::Block;
 use crate::native::writer::BlockWriter;
-use crate::{Client, Compression, sql};
+use crate::{Client, sql};
 use std::time::Duration;
 
 /// Executes an `INSERT ... FORMAT Native` statement.
@@ -29,12 +29,7 @@ impl InsertNative {
         sql.push_str(" FORMAT Native");
 
         Self {
-            writer: BlockWriter::new(InsertFormatted::new(
-                // FIXME: use HTTP body compression instead of block-level compression
-                &client.clone().with_compression(Compression::None),
-                sql,
-                Some(table_name),
-            )),
+            writer: BlockWriter::new(InsertFormatted::new(client, sql, Some(table_name))),
         }
     }
 
@@ -125,8 +120,7 @@ impl InsertNative {
     /// If this `async` method is canceled (i.e. by dropping the resulting `Future`),
     /// the insert is automatically aborted.
     ///
-    /// This is because the block data is not sent in a single write, since that would require
-    /// copying it into a separate buffer. There is no way to resynchronize the stream
+    /// A block may be split across several bounded writes. There is no way to resynchronize the stream
     /// once a block has been partially sent. Resuming a write would corrupt the stream.
     pub async fn write(&mut self, block: &Block) -> crate::Result<()> {
         self.writer.write(block).await
@@ -140,7 +134,21 @@ impl InsertNative {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Client, ProductInfo};
+    use crate::{Client, Compression, ProductInfo};
+
+    #[test]
+    fn preserves_compression() {
+        let client = Client::default().with_compression(Compression::None);
+        let insert = client.insert_native("foo");
+        assert_eq!(insert.writer.expect_client().compression, Compression::None);
+
+        #[cfg(feature = "lz4")]
+        {
+            let client = client.with_compression(Compression::Lz4);
+            let insert = client.insert_native("foo");
+            assert_eq!(insert.writer.expect_client().compression, Compression::Lz4);
+        }
+    }
 
     // These various setters are already covered functionally in `tests/it/insert_formatted.rs`;
     // we just need to check that they're forwarded correctly for `InsertNative`.

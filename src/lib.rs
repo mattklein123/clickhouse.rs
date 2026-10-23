@@ -12,6 +12,7 @@ use crate::row_metadata::{AccessType, ColumnDefaultKind, InsertMetadata, RowMeta
 #[doc = include_str!("row_derive.md")]
 pub use clickhouse_macros::Row;
 use clickhouse_types::{Column, DataTypeNode};
+pub use native::NativeRow;
 
 use crate::error::Error;
 use std::collections::HashSet;

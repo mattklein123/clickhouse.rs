@@ -1,9 +1,15 @@
 use crate::Client;
 use crate::error::Error;
 use crate::insert_formatted::InsertFormatted;
-use crate::native::{Block, Column, Layout, LayoutKind, varuint};
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::native::{Block, Column, DataTypeNode, Layout, LayoutKind, varuint};
+use bytes::{Bytes, BytesMut};
 use std::num::Saturating;
+
+#[cfg(all(test, feature = "lz4", feature = "test-util"))]
+#[path = "writer_test.rs"]
+mod tests;
+
+const BUFFER_SIZE: usize = 1024 * 1024;
 
 pub(crate) struct BlockWriter {
     insert: InsertFormatted,
@@ -15,7 +21,7 @@ impl BlockWriter {
     pub(crate) fn new(insert: InsertFormatted) -> Self {
         Self {
             insert,
-            buf: BytesMut::with_capacity(8192),
+            buf: BytesMut::with_capacity(BUFFER_SIZE),
             sent_rows: Saturating(0),
         }
     }
@@ -46,17 +52,13 @@ impl BlockWriter {
             finished: false,
         };
 
-        varuint::write(&mut guard.buf, block.columns.len());
-        varuint::write(&mut guard.buf, block.num_rows);
+        guard.write_varuint(block.columns.len()).await?;
+        guard.write_varuint(block.num_rows).await?;
 
         for column in &block.columns {
             guard.write_column(column).await?;
         }
 
-        // We deliberately don't send the block header right away
-        // since the first column header can share the same buffer.
-        //
-        // If `write_column()` wrote any data, this should be a no-op.
         guard.flush().await?;
 
         guard.finished = true;
@@ -96,15 +98,28 @@ struct WriteGuard<'a> {
 
 impl WriteGuard<'_> {
     async fn write_column(&mut self, column: &Column) -> Result<(), Error> {
-        varuint::write(&mut self.buf, column.name.len());
-        self.buf.extend_from_slice(column.name.as_bytes());
+        self.write_varuint(column.name.len()).await?;
+        self.send(column.name.as_bytes()).await?;
 
         // We have to format the data type to know exactly how long the string is,
         // though in most cases we can use a static string.
         let data_type_str = column.data_type.to_str();
 
-        varuint::write(&mut self.buf, data_type_str.len());
-        self.buf.extend_from_slice(data_type_str.as_bytes());
+        self.write_varuint(data_type_str.len()).await?;
+        self.send(data_type_str.as_bytes()).await?;
+
+        if matches!(column.data_type, DataTypeNode::AggregateFunction(_, _)) {
+            match &column.layout.kind {
+                LayoutKind::Variable { data, .. } => self.send_data(data).await?,
+                LayoutKind::Chunked { chunks } => {
+                    for chunk in chunks {
+                        self.send_data(chunk).await?;
+                    }
+                }
+                _ => return Err(Error::Other("invalid aggregate state layout".into())),
+            }
+            return Ok(());
+        }
 
         self.write_layout(&column.layout).await
     }
@@ -115,8 +130,14 @@ impl WriteGuard<'_> {
         }
 
         match &layout.kind {
+            LayoutKind::Chunked { chunks } => {
+                for chunk in chunks {
+                    self.write_varuint(chunk.len()).await?;
+                    self.send_data(chunk).await?;
+                }
+            }
             LayoutKind::Fixed { data, .. } => {
-                self.send(data).await?;
+                self.send_data(data).await?;
             }
             LayoutKind::Variable { end_offsets, data } => {
                 let mut start_offset = 0;
@@ -127,9 +148,14 @@ impl WriteGuard<'_> {
                         .checked_sub(start_offset)
                         .ok_or_else(|| Error::Other(format!("BUG: string length underflow in encoding block: {end_offset} - {start_offset}").into()))?;
 
-                    varuint::write(&mut self.buf, len);
+                    self.write_varuint(len).await?;
 
-                    self.send(&data.slice(start_offset..end_offset)).await?;
+                    if len >= BUFFER_SIZE {
+                        self.send_data(&data.slice(start_offset..end_offset))
+                            .await?;
+                    } else {
+                        self.send(&data[start_offset..end_offset]).await?;
+                    }
 
                     start_offset = end_offset;
                 }
@@ -144,9 +170,10 @@ impl WriteGuard<'_> {
                 elem_layout,
             } => {
                 for index in end_indices {
-                    self.buf.put_u64_le(u64::try_from(*index).map_err(|_| {
+                    let index = u64::try_from(*index).map_err(|_| {
                         Error::Other(format!("array end index out of range: {index}").into())
-                    })?);
+                    })?;
+                    self.send(&index.to_le_bytes()).await?;
                 }
 
                 Box::pin(self.write_layout(elem_layout)).await?;
@@ -161,9 +188,10 @@ impl WriteGuard<'_> {
                 end_indices,
             } => {
                 for index in end_indices {
-                    self.buf.put_u64_le(u64::try_from(*index).map_err(|_| {
+                    let index = u64::try_from(*index).map_err(|_| {
                         Error::Other(format!("map end index out of range: {index}").into())
-                    })?);
+                    })?;
+                    self.send(&index.to_le_bytes()).await?;
                 }
 
                 Box::pin(self.write_layout(&key_val_layouts[0])).await?;
@@ -174,23 +202,46 @@ impl WriteGuard<'_> {
         Ok(())
     }
 
-    async fn send(&mut self, data: &Bytes) -> Result<(), Error> {
-        /// If a data buffer is smaller than this threshold, copy it to `self.buf` instead.
-        const COPY_THRESHOLD: usize = 128;
-
-        if data.len() < COPY_THRESHOLD {
-            self.buf.extend_from_slice(data);
-            Ok(())
-        } else {
+    async fn write_varuint(&mut self, value: usize) -> Result<(), Error> {
+        if self.buf.len() > BUFFER_SIZE - 10 {
             self.flush().await?;
-
-            self.insert.send(data.clone()).await
         }
+        varuint::write(&mut *self.buf, value);
+        Ok(())
+    }
+
+    async fn send(&mut self, mut data: &[u8]) -> Result<(), Error> {
+        while !data.is_empty() {
+            let len = data.len().min(BUFFER_SIZE - self.buf.len());
+            self.buf.extend_from_slice(&data[..len]);
+            data = &data[len..];
+
+            if self.buf.len() == BUFFER_SIZE {
+                self.flush().await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_data(&mut self, data: &Bytes) -> Result<(), Error> {
+        let mut offset = 0;
+        if !self.buf.is_empty() {
+            let len = data.len().min(BUFFER_SIZE - self.buf.len());
+            self.send(&data[..len]).await?;
+            offset = len;
+        }
+        while data.len() - offset >= BUFFER_SIZE {
+            self.insert
+                .send(data.slice(offset..offset + BUFFER_SIZE))
+                .await?;
+            offset += BUFFER_SIZE;
+        }
+        self.send(&data[offset..]).await
     }
 
     async fn flush(&mut self) -> Result<(), Error> {
         if !self.buf.is_empty() {
-            self.insert.send(self.buf.split().freeze()).await?;
+            self.insert.send_buffer(self.buf).await?;
         }
 
         Ok(())
